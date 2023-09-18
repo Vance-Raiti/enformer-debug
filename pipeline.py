@@ -2,10 +2,16 @@ import torch
 from basenji import BasenjiDataset
 import wandb
 import os
+import sys
 from enformer.metrics import MeanPearsonCorrCoefPerChannel as MPCCPC
 from enformer.modeling_enformer import Enformer
 from torch.optim.lr_scheduler import LambdaLR
 
+from torch import _dynamo
+_dynamo.config.suppress_errors = True
+
+from einops._torch_specific import allow_ops_in_compiled_graph
+allow_ops_in_compiled_graph()
 
 n_epochs = 10
 n_train = 34000
@@ -26,10 +32,11 @@ train_data, valid_data = [
     )
     for split in ['train','valid']
 ]
-
-#os.environ['WANDB_MODE'] = 'disabled'
-os.environ['WANDB_SILENT']='true'
-os.environ['WANDB_CONSOLE']='off'
+if '-w' in sys.argv:
+    os.environ['WANDB_MODE'] = 'disabled'
+else:
+    os.environ['WANDB_SILENT']='true'
+    os.environ['WANDB_CONSOLE']='off'
 
 
 optimizer = torch.optim.AdamW(
@@ -81,15 +88,17 @@ for epoch in range(n_epochs):
             'train/correlation': corr_coef.item(),
             'train/loss': l.item(),
             'iteration': it+n_train*epoch,
+            'lr': schedule.get_last_lr()[0],
         }
         print(log)
         wandb.log(log)
+        schedule.step()
     mpccpc.reset()
 
     model.eval()
     for it, data in enumerate(valid_data):
         x = data['features'].to('cuda')
-        y = torch.from_numpy(data['targets']).to('cuda')
+        y = data['targets'].to('cuda')
         with torch.autocast('cuda'), torch.no_grad():
             y_hat = model(x)
             l = loss(y_hat,y)
