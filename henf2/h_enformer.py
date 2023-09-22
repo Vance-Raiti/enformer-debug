@@ -88,23 +88,14 @@ class Enformer(nn.Module):
                 AttentionPool(dim_out, pool_size = 2)
             ))
         
-        # The action of downsampling is actually important because it means that when we perform target_length_crop
-        # that we're only cropping out about 50% of the information, so if we want to reduce the amount of downsampling
-        # for the purposes of preserving positional information, perform the rest of the downsampling at the end
-        self.conv_tower_prefix = nn.Sequential(*conv_layers[:config.prefix_downsamples]) 
-        self.conv_tower_suffix = nn.Sequential(*conv_layers[config.prefix_downsamples:])
+        self.conv_tower = nn.Sequential(*conv_layers) 
         # transformer
         attn_config = copy(config)
-        attn_config.dim = filter_list[config.prefix_downsamples]
         attn_config.input_length = config.attn_input_length
-        if config.rearrange:
-            tblock = H_TBlock_R
-        else:
-            tblock = H_TBlock
         
         self.transformer = nn.Sequential(
             *[
-                tblock(attn_config)
+                H_TBlock(attn_config)
                 for _ in range(config.depth)
             ]
         )
@@ -158,9 +149,6 @@ class Enformer(nn.Module):
     ):
         b, n, d = x.shape
         config = self.config
-        if n != config.input_length:
-            print(f'WARNNG: skipping input of length {n}')
-            return None
         head = head[0]
         
 
@@ -177,7 +165,7 @@ class Enformer(nn.Module):
 
         x = rearrange(x,'b n d -> b d n')
         x = self.stem(x)
-        x = self.conv_tower_prefix(x)
+        x = self.conv_tower(x)
         x = rearrange(x,'b d n -> b n d')
         
         x = checkpoint_sequential(
@@ -185,9 +173,6 @@ class Enformer(nn.Module):
             segments = config.depth-1,
             input = x,
         )
-        x = rearrange(x,'b n d -> b d n')
-        x = self.conv_tower_suffix(x)
-        x = rearrange(x,'b d n -> b n d')
 
         x = self.crop_final(x)
         x = self.final_pointwise(x)

@@ -7,13 +7,9 @@ from os.path import exists, join,dirname
 import sys
 from random import choice
 
+import henf
 from enformer.metrics import MeanPearsonCorrCoefPerChannel as MPCCPC
-from enformer.modeling_enformer import Enformer
 from torch.optim.lr_scheduler import LambdaLR
-import math
-
-from henf import Enformer as HEnformer
-from henf2 import Enformer as HEnformer2
 
 from torch import _dynamo
 _dynamo.config.suppress_errors = True
@@ -21,42 +17,40 @@ _dynamo.config.suppress_errors = True
 from einops._torch_specific import allow_ops_in_compiled_graph
 allow_ops_in_compiled_graph()
 
+Enformer = henf.Enformer
+
 ename = dirname(__file__)
 checkpoints = join(ename,'checkpoints')
 
-rid = sys.argv[1]
+rid = None
+from_checkpoint = '-id' in sys.argv
+epoch = 3
+lr = 5e-5
+for i,arg in enumerate(sys.argv):
+    if arg == '-lr':
+        lr = float(sys.argv[i+1])
+    if arg == '-id':
+        rid = sys.argv[i+1]
+    if arg == '-ep':
+        epoch = int(sys.argv[i+1])-1
+
+if rid is None:
+    chrs = [chr(a) for a in range(ord('a'),ord('z')+1)]
+    chrs.extend([chr(a) for a in range(ord('A'),ord('Z')+1)])
+    rid = choice(chrs)
+    chrs.extend([chr(a) for a in range(ord('1'),ord('9')+1)])
+    for _ in range(6):
+        rid += choice(chrs)
+
+if not exists(checkpoints):
+    os.mkdir(checkpoints)
 checkpoint = join(checkpoints,rid+'.pt')
 
-
-sd = torch.load(checkpoint)
-config = sd['config']
-lr = config['lr']
-debug = config['debug']
-n_epochs = config['n_epochs']
-epoch = config['epoch']
-config['epoch'] += 1
-arch = config['arch']
-
-if 'sequence_length' in config:
-    sequence_length = config['sequence_length']
-else:
-    sequence_length = 196608
-
-
-if arch == 'h-enformer':
-    arch = HEnformer
-elif arch == 'h-enformer-2':
-    arch = HEnformer2
-else:
-    arch = Enformer
-
+n_epochs = 10
 n_train = 34000
 n_valid = 2000
-
-
-
-model = arch.from_hparams(
-    **config['model_kwargs'],
+model = Enformer.from_hparams(
+    output_heads = dict(human = 5313),
 )
 
 loss = torch.nn.PoissonNLLLoss(log_input=False)
@@ -65,13 +59,13 @@ mpccpc = MPCCPC(n_channels = 5313).to('cuda')
 
 train_data, valid_data = [
     torch.utils.data.DataLoader(
-        BasenjiDataset(**config['dataset_kwargs']),
+        BasenjiDataset(organism='human',split=split),
         batch_size=1,
         num_workers=0,
     )
     for split in ['train','valid']
 ]
-if debug:
+if '-w' in sys.argv:
     os.environ['WANDB_MODE'] = 'disabled'
 else:
     os.environ['WANDB_SILENT']='true'
@@ -79,7 +73,9 @@ else:
 
 
 optimizer = torch.optim.AdamW(
-    model.parameters()|**config['optimizer_kwargs']
+    model.parameters(),
+    lr=5e-5,
+    weight_decay=4e-2,
 )
 
 class linear_warmup_cosine_decay(LambdaLR):
@@ -96,55 +92,37 @@ class linear_warmup_cosine_decay(LambdaLR):
             return 0.5*math.cos(theta)+0.5
         super().__init__(lr_lambda=lwcd,**kwargs)
 
-lr_schedule = linear_warmup_cosine_decay(optimizer=optimizer,warmup=int(9e4),N=n_train*n_epochs)
+lr_schedule = linear_warmup_cosine_decay(optimizer=optimizer,warmup=int(9e4),N=34000*n_epochs)
 scaler = torch.cuda.amp.GradScaler()
 
 
-if not config['debug']:
-    model = torch.compile(model)
 
-if epoch > 0:
+model = torch.compile(model)
+
+if from_checkpoint:
     sd = torch.load(join(checkpoints,rid+'.pt'))
     model.load_state_dict(sd['model'])
     optimizer.load_state_dict(sd['optimizer'])
     lr_schedule.load_state_dict(sd['lr_schedule'])
-    
 
 model = model.to('cuda')
 
-def optimizer_to(optim,device):
-    for param in optim.state.values():
-        if isinstance(param, torch.Tensor):
-            param.data = param.data.to(device)
-            if param._grad is not None:
-                param._grad.data = param._grad.to(device)
-        elif isinstance(param, dict):
-            for subparam in param.values():
-                if isinstance(subparam, torch.Tensor):
-                    subparam.data = subparam.data.to(device)
-                    if subparam._grad is not None:
-                        subparam._grad.data = subparam._grad.data.to(device)
-
-optimizer_to(optimizer,'cuda')
-
 wandb.init(
     project = 'enformer-vance',
-    id = rid,
-    config = config,
-    resume = True,
+    id=rid,
 )
 
 
 
 model.train()
 for it, data in enumerate(train_data):
+    if it>100:
+        break
     x = data['features'].to('cuda')
     y = data['targets'].to('cuda')
     lr_schedule.step()
     with torch.autocast('cuda'):
         y_hat = model(x)
-        if y_hat is None:
-            continue
         l = loss(y_hat,y)
         scaler.scale(l).backward()
         scaler.unscale_(optimizer)
@@ -168,12 +146,12 @@ mpccpc.reset()
 
 model.eval()
 for it, data in enumerate(valid_data):
+    if it>100:
+        break
     x = data['features'].to('cuda')
     y = data['targets'].to('cuda')
     with torch.autocast('cuda'), torch.no_grad():
         y_hat = model(x)
-        if y_hat is None:
-            continue
         l = loss(y_hat,y)
         mpccpc.update(y_hat,y)
         corr_coef = mpccpc.compute().mean()
@@ -189,26 +167,21 @@ for it, data in enumerate(valid_data):
 wandb.finish()
 
 model = model.to('cpu')
-optimizer_to(optimizer,'cpu')
-
 
 torch.save(
     {
         'model': model.state_dict(),
         'optimizer': optimizer.state_dict(),
         'lr_schedule': lr_schedule.state_dict(),
-        'config': config
     },
     checkpoint
 )
 
-if epoch == n_epochs:
+if epoch == 0:
     print('training done!')
     exit()
 
-if debug:
-    cmd = f'source job.sh {rid}'
-else:
-    cmd = f'qsub -P aclab -o logs/{rid}.log -e logs/{rid}.log -l gpus=1 -N {rid} -pe omp 32 -l gpu_c=7.0 -l h_rt=11:00:00 job.sh {rid}'
-print(cmd)
+args = f'-lr {lr} -ep {epoch} -id {rid}'
+print(args)
+cmd = f'qsub -P aclab -o job.log -e job.log -l gpus=1 -N {rid} -pe omp 32 -l gpu_c=7.0 -l h_rt=11:00:00 job.sh {args}'
 os.system(cmd)

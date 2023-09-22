@@ -23,11 +23,11 @@ class HEnformerConfig(EnformerConfig):
     
     
     input_length: int = 196608
-    segment_length: int = 64
-    representative_length: int = 8
+    segment_length: int = 512
+    representative_length: int = 32
     prefix_downsamples: int = 5
     rearrange: bool = True
-    attn_embed = 'abs_param'
+    attn_embed = 'enformer'
     def __init__(self,*args,**kwargs):
         super().__init__(*args,**kwargs)
         assert self.num_downsamples <= 16, self.num_downsamples
